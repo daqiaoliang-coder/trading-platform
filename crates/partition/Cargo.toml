@@ -1,0 +1,13 @@
+[package]
+name = "trading-partition"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fs2.workspace = true
+trading-protocol.workspace = true
+trading-storage.workspace = true
+
+[lib]
+path = "src/lib.rs"

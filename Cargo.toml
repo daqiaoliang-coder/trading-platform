@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "crates/protocol",
+    "crates/storage",
+    "crates/partition",
+    "crates/loadgen",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+crc32fast = "1.4"
+fs2 = "0.4"
+trading-protocol = { path = "crates/protocol" }
+trading-storage = { path = "crates/storage" }
+trading-partition = { path = "crates/partition" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
