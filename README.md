@@ -2,7 +2,7 @@
 
 一个面向高并发、强一致和持久化交易场景的分片式交易平台。项目采用 **分片单写状态机 + WAL 组提交 + 快照恢复 + 分片级复制** 的架构，通用数据库仅承担异步查询、对账和归档，不位于核心交易提交链路。
 
-> 当前阶段：M1 单机交易内核、WAL 与快照已实现，并通过恢复测试、静态检查和 10 万笔交易压测。后续依次实现水平扩容、高可用和在线分片迁移。
+> 当前阶段：M2 多逻辑分片、版本化路由和独立分片定序已实现。每分片拥有独立队列、单写线程、WAL 与快照；后续依次实现高可用和在线分片迁移。
 
 ## 1. 项目目标
 
@@ -66,6 +66,24 @@ cargo run --release -p trading-loadgen -- \
 
 `--unsafe-buffered` 不保证崩溃后保留已响应交易，禁止作为严格持久化结果汇报。
 
+### M2 多逻辑分片
+
+使用 `--shards` 指定逻辑分片数。路由表携带单调递增的版本，账户按固定路由槽定位分片；M2 只允许提升版本，槽位映射变更由 M4 的状态与幂等迁移流程处理。原子转账要求两个账户位于同一分片，跨分片转账在进入执行队列前拒绝。
+
+```bash
+cargo run --release -p trading-loadgen -- \
+  --ops 100000 \
+  --concurrency 32 \
+  --accounts 1024 \
+  --shards 4 \
+  --batch 64 \
+  --checkpoint
+```
+
+数据分别保存在 `shard-N/partition.wal` 和 `shard-N/snapshot.bin`。压测输出每分片吞吐占比、队列深度、批次延迟、P50/P99/P999 和独立序号，并逐分片校验余额、幂等结果及 checkpoint 恢复。过期的显式路由会收到当前路由作为重定向，客户端使用原 `request_id` 重试即可保持幂等。
+
+追加 `--postgres-url postgres://user:password@host/database` 可启用异步已提交日志投影。各分片写线程在 WAL 提交和状态执行后，按分片序号发送 `(shard_id, route_version, sequence)` 事件；PostgreSQL 投影在独立线程中批量事务写入 `trading_committed_events`，并以该三元组主键和 `ON CONFLICT DO NOTHING` 保证重复消费不产生重复行。
+
 ### 本机 M1 基线
 
 2026-11-01，本机 macOS Intel x86_64，release 构建，10 万笔转账、32 并发、1024 个账户、最大批次 64。每笔命令 44 字节，对应 WAL 记录 68 字节；结果不包含账户初始化耗时。
@@ -79,11 +97,12 @@ cargo run --release -p trading-loadgen -- \
 
 ### 当前边界
 
-- M1 是嵌入式交易内核和压测工具，尚未提供网络服务。
+- 当前是嵌入式交易内核和压测工具，尚未提供网络服务。
 - 当前 checkpoint 在单写执行器停止、取得 `Partition` 所有权后执行；在线快照将在后续实现。
 - 幂等结果完整保存在内存和快照中，尚未实现保留窗口和淘汰策略。
 - 已测试半条日志与 CRC 损坏，尚未进行真实断电、磁盘固件和带断电保护硬件验证。
-- M1 仅提供本地持久化，不包含副本、主机故障 RPO=0 或自动故障切换。
+- 当前仅提供本地持久化，不包含副本、主机故障 RPO=0 或自动故障切换。
+- PostgreSQL 投影是在线最小实现，投影故障后的自动追赶及其与 checkpoint 的协调尚未实现。
 
 ## 2. 总体架构
 
@@ -313,7 +332,8 @@ trading-platform/
 ├── crates/
 │   ├── protocol/       # 请求、响应和 WAL 二进制格式
 │   ├── storage/        # WAL、快照、校验与恢复
-│   ├── partition/      # 单写状态机、队列和分片执行
+│   ├── partition/      # 单写状态机、队列、路由和分片执行
+│   ├── projection/     # 已提交日志的异步 PostgreSQL 投影
 │   ├── replication/    # M3：分片复制与主备切换
 │   ├── gateway/        # 网络接入、路由和背压
 │   └── loadgen/        # 独立压测与延迟直方图

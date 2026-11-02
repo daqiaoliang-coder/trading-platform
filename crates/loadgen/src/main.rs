@@ -1,26 +1,29 @@
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use trading_partition::{
-    Engine, EngineConfig, EngineHandle, Partition, PartitionConfig, SyncPolicy,
-};
+use trading_partition::{ClusterConfig, RouteTable, ShardedCluster, SyncPolicy};
+use trading_projection::PostgresProjection;
 use trading_protocol::{Command, SubmitError};
 
 const INITIAL_BALANCE: u64 = 10_000_000_000;
+const ROUTE_VERSION: u64 = 1;
 
 #[derive(Debug)]
 struct Config {
     ops: u64,
     concurrency: usize,
     accounts: u64,
+    shards: u16,
     queue_capacity: usize,
     max_batch_size: usize,
     data_dir: PathBuf,
     sync_policy: SyncPolicy,
     checkpoint: bool,
+    postgres_url: Option<String>,
 }
 
 impl Config {
@@ -30,12 +33,14 @@ impl Config {
             ops: 100_000,
             concurrency: 32,
             accounts: 1024,
+            shards: 1,
             queue_capacity: 4096,
             max_batch_size: 64,
             data_dir: std::env::temp_dir()
                 .join(format!("trading-loadgen-{}-{unique}", std::process::id())),
             sync_policy: SyncPolicy::Durable,
             checkpoint: false,
+            postgres_url: None,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -43,6 +48,7 @@ impl Config {
                 "--ops" => config.ops = next(&mut args, "--ops")?,
                 "--concurrency" => config.concurrency = next(&mut args, "--concurrency")?,
                 "--accounts" => config.accounts = next(&mut args, "--accounts")?,
+                "--shards" => config.shards = next(&mut args, "--shards")?,
                 "--queue" => config.queue_capacity = next(&mut args, "--queue")?,
                 "--batch" => config.max_batch_size = next(&mut args, "--batch")?,
                 "--data-dir" => {
@@ -50,6 +56,7 @@ impl Config {
                 }
                 "--unsafe-buffered" => config.sync_policy = SyncPolicy::UnsafeBuffered,
                 "--checkpoint" => config.checkpoint = true,
+                "--postgres-url" => config.postgres_url = Some(next(&mut args, "--postgres-url")?),
                 "--help" | "-h" => {
                     print_help();
                     return Ok(None);
@@ -59,6 +66,9 @@ impl Config {
         }
         if config.ops == 0 || config.concurrency == 0 || config.accounts < 2 {
             return Err("ops/concurrency must be positive and accounts must be at least 2".into());
+        }
+        if config.shards == 0 || config.accounts < config.shards as u64 * 2 {
+            return Err("shards must be positive and accounts must be at least 2 per shard".into());
         }
         if config.queue_capacity == 0 || config.max_batch_size == 0 {
             return Err("queue and batch must be positive".into());
@@ -83,12 +93,14 @@ where
 }
 
 fn print_help() {
-    println!("trading-loadgen [--ops N] [--concurrency N] [--accounts N] [--queue N] [--batch N]");
-    println!("                [--data-dir PATH] [--unsafe-buffered] [--checkpoint]");
+    println!("trading-loadgen [--ops N] [--concurrency N] [--accounts N] [--shards N]");
+    println!("                [--queue N] [--batch N] [--data-dir PATH]");
+    println!("                [--unsafe-buffered] [--checkpoint] [--postgres-url URL]");
 }
 
 struct WorkerResult {
-    latencies_ns: Vec<u64>,
+    shard_latencies_ns: Vec<Vec<u64>>,
+    committed_by_shard: Vec<u64>,
     errors: u64,
 }
 
@@ -98,37 +110,63 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     println!("data_dir={}", config.data_dir.display());
     println!(
-        "ops={} concurrency={} accounts={} batch={} durability={:?}",
-        config.ops, config.concurrency, config.accounts, config.max_batch_size, config.sync_policy
+        "ops={} concurrency={} accounts={} shards={} route_version={} batch={} durability={:?}",
+        config.ops,
+        config.concurrency,
+        config.accounts,
+        config.shards,
+        ROUTE_VERSION,
+        config.max_batch_size,
+        config.sync_policy
     );
 
-    let partition_config = PartitionConfig {
+    let cluster_config = ClusterConfig {
         data_dir: config.data_dir.clone(),
         sync_policy: config.sync_policy,
-    };
-    let partition = Partition::open(partition_config.clone())?;
-    let engine = Engine::new(
-        partition,
-        EngineConfig {
+        engine: trading_partition::EngineConfig {
             queue_capacity: config.queue_capacity,
             max_batch_size: config.max_batch_size,
             batch_wait: Duration::from_micros(200),
         },
-    );
-    let handle = Arc::new(engine.spawn());
+    };
+    let routes = RouteTable::uniform(ROUTE_VERSION, config.shards)?;
+    let (event_sender, projection) = match &config.postgres_url {
+        Some(url) => {
+            let (sender, receiver) = mpsc::channel();
+            (
+                Some(sender),
+                Some(PostgresProjection::spawn(url, receiver)?),
+            )
+        }
+        None => (None, None),
+    };
+    let cluster = match event_sender {
+        Some(sender) => {
+            ShardedCluster::open_with_event_sender(cluster_config.clone(), routes.clone(), sender)
+        }
+        None => ShardedCluster::open(cluster_config.clone(), routes.clone()),
+    }?;
+    let cluster = Arc::new(cluster);
 
+    let shard_count = config.shards as usize;
+    let mut accounts_by_shard = vec![Vec::new(); shard_count];
+    let mut expected_sequences = vec![0_u64; shard_count];
     let mut setup_request = 1_u128;
     for account in 1..=config.accounts {
-        require_success(handle.submit(Command::open_account(setup_request, account))?)?;
+        let shard = cluster.route_account(account).shard_id as usize;
+        accounts_by_shard[shard].push(account);
+        require_success(cluster.submit(Command::open_account(setup_request, account))?)?;
         setup_request += 1;
-        require_success(handle.submit(Command::deposit(
+        require_success(cluster.submit(Command::deposit(
             setup_request,
             account,
             INITIAL_BALANCE,
         ))?)?;
         setup_request += 1;
+        expected_sequences[shard] += 2;
     }
 
+    let accounts_by_shard = Arc::new(accounts_by_shard);
     let expected_balances = Arc::new(
         (0..=config.accounts)
             .map(|_| AtomicI64::new(INITIAL_BALANCE as i64))
@@ -137,91 +175,135 @@ fn main() -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
     let mut workers = Vec::with_capacity(config.concurrency);
     for worker_id in 0..config.concurrency {
-        let handle = Arc::clone(&handle);
+        let cluster = Arc::clone(&cluster);
+        let accounts_by_shard = Arc::clone(&accounts_by_shard);
         let expected_balances = Arc::clone(&expected_balances);
         let count = config.ops / config.concurrency as u64
             + u64::from((worker_id as u64) < config.ops % config.concurrency as u64);
         let accounts = config.accounts;
         workers.push(thread::spawn(move || {
-            run_worker(worker_id, count, accounts, handle, expected_balances)
+            run_worker(
+                worker_id,
+                count,
+                accounts,
+                cluster,
+                accounts_by_shard,
+                expected_balances,
+            )
         }));
     }
 
-    let mut latencies = Vec::with_capacity(config.ops as usize);
+    let mut shard_latencies_ns = vec![Vec::new(); shard_count];
+    let mut committed_by_shard = vec![0_u64; shard_count];
     let mut errors = 0_u64;
     for worker in workers {
         let result = worker
             .join()
             .map_err(|_| "load generator worker panicked")?;
         errors += result.errors;
-        latencies.extend(result.latencies_ns);
+        for shard in 0..shard_count {
+            committed_by_shard[shard] += result.committed_by_shard[shard];
+            shard_latencies_ns[shard].extend(result.shard_latencies_ns[shard].iter().copied());
+        }
     }
     let elapsed = started.elapsed();
-    latencies.sort_unstable();
+    let mut latencies_ns: Vec<_> = shard_latencies_ns
+        .iter()
+        .flat_map(|latencies| latencies.iter().copied())
+        .collect();
+    latencies_ns.sort_unstable();
+    for latencies in &mut shard_latencies_ns {
+        latencies.sort_unstable();
+    }
+    for (shard, successful) in committed_by_shard.iter().enumerate() {
+        expected_sequences[shard] += successful;
+    }
 
-    let handle = match Arc::try_unwrap(handle) {
-        Ok(handle) => handle,
-        Err(_) => return Err("engine handle still has outstanding owners".into()),
+    let metrics = cluster.metrics();
+    let cluster = match Arc::try_unwrap(cluster) {
+        Ok(cluster) => cluster,
+        Err(_) => return Err("cluster handle still has outstanding owners".into()),
     };
-    let mut partition = handle.shutdown()?;
-    let expected_sequence = config.accounts * 2 + config.ops - errors;
-    let expected_results = expected_sequence;
-    if partition.last_sequence() != expected_sequence {
-        return Err(format!(
-            "sequence mismatch: expected {expected_sequence}, got {}",
-            partition.last_sequence()
-        )
-        .into());
-    }
-    let mut recovery_verified = false;
+    let mut partitions = cluster.shutdown()?;
+    let projection_stats = projection.map(|handle| handle.shutdown()).transpose()?;
     if config.checkpoint {
-        partition.checkpoint()?;
-        drop(partition);
-        partition = Partition::open(partition_config)?;
-        if partition.last_sequence() != expected_sequence
-            || partition.account_count() != config.accounts as usize
-            || partition.result_count() != expected_results as usize
-        {
-            return Err("checkpoint recovery metadata mismatch".into());
+        for partition in partitions.values_mut() {
+            partition.checkpoint()?;
         }
-        recovery_verified = true;
+        drop(partitions);
+        let recovered = ShardedCluster::open(cluster_config, routes)?;
+        partitions = recovered.shutdown()?;
     }
 
-    for (account, expected) in expected_balances.iter().enumerate().skip(1) {
-        let expected = expected.load(AtomicOrdering::Relaxed) as u64;
-        let actual = partition
-            .balance(account as u64)
-            .ok_or_else(|| format!("missing account {account} after execution"))?;
-        if actual != expected {
+    let mut total_accounts = 0_usize;
+    let mut total_results = 0_usize;
+    let mut total_balance = 0_u128;
+    for shard in 0..shard_count {
+        let partition = partitions
+            .get(&(shard as u16))
+            .ok_or_else(|| format!("missing shard {shard} after execution"))?;
+        let expected_sequence = expected_sequences[shard];
+        if partition.last_sequence() != expected_sequence {
             return Err(format!(
-                "account {account} balance mismatch: expected {expected}, got {actual}"
+                "shard {shard} sequence mismatch: expected {expected_sequence}, got {}",
+                partition.last_sequence()
+            )
+            .into());
+        }
+        if partition.result_count() != expected_sequence as usize {
+            return Err(format!(
+                "shard {shard} idempotency result mismatch: expected {expected_sequence}, got {}",
+                partition.result_count()
+            )
+            .into());
+        }
+        if partition.account_count() != accounts_by_shard[shard].len() {
+            return Err(format!(
+                "shard {shard} account count mismatch: expected {}, got {}",
+                accounts_by_shard[shard].len(),
+                partition.account_count()
+            )
+            .into());
+        }
+        for account in &accounts_by_shard[shard] {
+            let expected =
+                expected_balances[*account as usize].load(AtomicOrdering::Relaxed) as u64;
+            let actual = partition
+                .balance(*account)
+                .ok_or_else(|| format!("missing account {account} after execution"))?;
+            if actual != expected {
+                return Err(format!(
+                    "account {account} balance mismatch: expected {expected}, got {actual}"
+                )
+                .into());
+            }
+        }
+        let expected_balance = accounts_by_shard[shard].len() as u128 * INITIAL_BALANCE as u128;
+        if partition.total_balance() != expected_balance {
+            return Err(format!(
+                "shard {shard} balance conservation failed: expected {expected_balance}, got {}",
+                partition.total_balance()
+            )
+            .into());
+        }
+        if metrics[&(shard as u16)].last_sequence != expected_sequence {
+            return Err(format!("shard {shard} metrics sequence mismatch").into());
+        }
+        total_accounts += partition.account_count();
+        total_results += partition.result_count();
+        total_balance += partition.total_balance();
+    }
+    let expected_sequence = expected_sequences.iter().sum::<u64>();
+    if let Some(stats) = projection_stats {
+        if stats.received != expected_sequence {
+            return Err(format!(
+                "projection event mismatch: expected {expected_sequence}, got {}",
+                stats.received
             )
             .into());
         }
     }
-    if partition.account_count() != config.accounts as usize {
-        return Err(format!(
-            "account count mismatch: expected {}, got {}",
-            config.accounts,
-            partition.account_count()
-        )
-        .into());
-    }
-    if partition.result_count() != expected_results as usize {
-        return Err(format!(
-            "idempotency result mismatch: expected {expected_results}, got {}",
-            partition.result_count()
-        )
-        .into());
-    }
-    let expected_balance = config.accounts as u128 * INITIAL_BALANCE as u128;
-    if partition.total_balance() != expected_balance {
-        return Err(format!(
-            "balance conservation failed: expected {expected_balance}, got {}",
-            partition.total_balance()
-        )
-        .into());
-    }
+
     let throughput = config.ops as f64 / elapsed.as_secs_f64();
     println!(
         "elapsed={:.3}s throughput={:.0} ops/s errors={errors}",
@@ -230,21 +312,54 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!(
         "p50={:.1}us p99={:.1}us p999={:.1}us",
-        percentile(&latencies, 500),
-        percentile(&latencies, 990),
-        percentile(&latencies, 999)
+        percentile(&latencies_ns, 500),
+        percentile(&latencies_ns, 990),
+        percentile(&latencies_ns, 999)
     );
+    for shard in 0..shard_count {
+        let metric = &metrics[&(shard as u16)];
+        let average_batch_us = if metric.batches == 0 {
+            0.0
+        } else {
+            metric.total_batch_latency_ns as f64 / metric.batches as f64 / 1000.0
+        };
+        let load_share = if metric.executed == 0 {
+            0.0
+        } else {
+            metric.executed as f64 / expected_sequence as f64 * 100.0
+        };
+        println!(
+            "shard={} accounts={} ops={} sequence={} load={:.1}% queue={}/{} rejected={} batches={} avg_batch={:.1}us max_batch={:.1}us p50={:.1}us p99={:.1}us p999={:.1}us",
+            shard,
+            accounts_by_shard[shard].len(),
+            committed_by_shard[shard],
+            partitions[&(shard as u16)].last_sequence(),
+            load_share,
+            metric.queue_depth,
+            metric.queue_capacity,
+            metric.overloaded,
+            metric.batches,
+            average_batch_us,
+            metric.max_batch_latency_ns as f64 / 1000.0,
+            percentile(&shard_latencies_ns[shard], 500),
+            percentile(&shard_latencies_ns[shard], 990),
+            percentile(&shard_latencies_ns[shard], 999),
+        );
+    }
     println!(
-        "last_sequence={} accounts={} idempotency_results={} total_balance={}",
-        partition.last_sequence(),
-        partition.account_count(),
-        partition.result_count(),
-        partition.total_balance()
+        "last_sequence_sum={} accounts={} idempotency_results={} total_balance={}",
+        expected_sequence, total_accounts, total_results, total_balance
     );
     println!(
         "checkpoint={} recovery_verified={}",
-        config.checkpoint, recovery_verified
+        config.checkpoint, config.checkpoint
     );
+    if let Some(stats) = projection_stats {
+        println!(
+            "projection_events={} projection_inserted={}",
+            stats.received, stats.inserted
+        );
+    }
     if errors != 0 {
         return Err(format!("load generator observed {errors} failed operations").into());
     }
@@ -255,31 +370,46 @@ fn run_worker(
     worker_id: usize,
     count: u64,
     accounts: u64,
-    handle: Arc<EngineHandle>,
+    cluster: Arc<ShardedCluster>,
+    accounts_by_shard: Arc<Vec<Vec<u64>>>,
     expected_balances: Arc<Vec<AtomicI64>>,
 ) -> WorkerResult {
-    let mut latencies_ns = Vec::with_capacity(count as usize);
+    let mut shard_latencies_ns = vec![Vec::new(); accounts_by_shard.len()];
+    let mut committed_by_shard = vec![0_u64; accounts_by_shard.len()];
     let mut errors = 0;
     let mut random = XorShift::new(0x9E3779B97F4A7C15 ^ (worker_id as u64 + 1));
     for index in 0..count {
         let from = random.next() % accounts + 1;
-        let to = (from + random.next() % (accounts - 1)) % accounts + 1;
+        let route = cluster.route_account(from);
+        let shard = route.shard_id as usize;
+        let shard_accounts = &accounts_by_shard[shard];
+        let candidate = random.next() as usize % shard_accounts.len();
+        let mut to = shard_accounts[candidate];
+        if to == from {
+            to = shard_accounts[(candidate + 1) % shard_accounts.len()];
+        }
         let request_id = ((worker_id as u128 + 1) << 64) | index as u128;
         let started = Instant::now();
-        match handle.submit(Command::transfer(request_id, from, to, 1)) {
-            Ok(result) if result.is_success() => {
-                expected_balances[from as usize].fetch_sub(1, AtomicOrdering::Relaxed);
-                expected_balances[to as usize].fetch_add(1, AtomicOrdering::Relaxed);
+        match cluster.submit_with_route(route, Command::transfer(request_id, from, to, 1)) {
+            Ok(result) => {
+                committed_by_shard[shard] += 1;
+                if result.is_success() {
+                    expected_balances[from as usize].fetch_sub(1, AtomicOrdering::Relaxed);
+                    expected_balances[to as usize].fetch_add(1, AtomicOrdering::Relaxed);
+                } else {
+                    errors += 1;
+                }
             }
-            Ok(_)
-            | Err(SubmitError::Overloaded)
+            Err(SubmitError::Overloaded)
             | Err(SubmitError::Stopped)
-            | Err(SubmitError::Storage(_)) => errors += 1,
+            | Err(SubmitError::Storage(_))
+            | Err(SubmitError::Route(_)) => errors += 1,
         }
-        latencies_ns.push(started.elapsed().as_nanos() as u64);
+        shard_latencies_ns[shard].push(started.elapsed().as_nanos() as u64);
     }
     WorkerResult {
-        latencies_ns,
+        shard_latencies_ns,
+        committed_by_shard,
         errors,
     }
 }

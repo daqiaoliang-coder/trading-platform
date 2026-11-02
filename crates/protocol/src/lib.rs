@@ -171,11 +171,70 @@ impl CommandResult {
     }
 }
 
+pub type ShardId = u16;
+pub type RouteVersion = u64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Route {
+    pub version: RouteVersion,
+    pub shard_id: ShardId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommittedEvent {
+    pub shard_id: ShardId,
+    pub route_version: RouteVersion,
+    pub sequence: u64,
+    pub command: Command,
+    pub result: CommandResult,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteError {
+    EmptyTable,
+    UnknownShard(ShardId),
+    CrossShard { primary: Route, secondary: Route },
+    StaleRoute { current: Route },
+    StaleVersion { current_version: RouteVersion },
+    MappingChanged,
+}
+
+impl fmt::Display for RouteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyTable => write!(f, "route table is empty"),
+            Self::UnknownShard(shard_id) => write!(f, "unknown shard: {shard_id}"),
+            Self::CrossShard { primary, secondary } => write!(
+                f,
+                "cross-shard transfer is not atomic: shard {} and shard {}",
+                primary.shard_id, secondary.shard_id
+            ),
+            Self::StaleRoute { current } => write!(
+                f,
+                "stale route: current route is shard {} at version {}",
+                current.shard_id, current.version
+            ),
+            Self::StaleVersion { current_version } => {
+                write!(
+                    f,
+                    "stale route table version: current version is {current_version}"
+                )
+            }
+            Self::MappingChanged => {
+                write!(f, "route slot changes require the shard migration workflow")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RouteError {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SubmitError {
     Overloaded,
     Stopped,
     Storage(String),
+    Route(RouteError),
 }
 
 impl fmt::Display for SubmitError {
@@ -184,6 +243,7 @@ impl fmt::Display for SubmitError {
             Self::Overloaded => write!(f, "partition queue is full"),
             Self::Stopped => write!(f, "partition executor has stopped"),
             Self::Storage(message) => write!(f, "storage failure: {message}"),
+            Self::Route(error) => write!(f, "routing failure: {error}"),
         }
     }
 }
