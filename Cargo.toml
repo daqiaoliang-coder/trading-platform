@@ -3,6 +3,7 @@ members = [
     "crates/protocol",
     "crates/storage",
     "crates/partition",
+    "crates/projection",
     "crates/loadgen",
 ]
 resolver = "2"
@@ -18,6 +19,8 @@ fs2 = "0.4"
 trading-protocol = { path = "crates/protocol" }
 trading-storage = { path = "crates/storage" }
 trading-partition = { path = "crates/partition" }
+trading-projection = { path = "crates/projection" }
+postgres = "0.19"
 
 [profile.release]
 lto = "thin"
