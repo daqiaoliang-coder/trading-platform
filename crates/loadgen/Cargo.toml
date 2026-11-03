@@ -8,6 +8,7 @@ license.workspace = true
 trading-protocol.workspace = true
 trading-partition.workspace = true
 trading-projection.workspace = true
+trading-replication.workspace = true
 
 [[bin]]
 name = "trading-loadgen"

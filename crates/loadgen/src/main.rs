@@ -9,21 +9,25 @@ use trading_partition::{ClusterConfig, RouteTable, ShardedCluster, SyncPolicy};
 use trading_projection::PostgresProjection;
 use trading_protocol::{Command, SubmitError};
 
-const INITIAL_BALANCE: u64 = 10_000_000_000;
-const ROUTE_VERSION: u64 = 1;
+mod replicated;
+
+pub(crate) const INITIAL_BALANCE: u64 = 10_000_000_000;
+pub(crate) const ROUTE_VERSION: u64 = 1;
 
 #[derive(Debug)]
-struct Config {
-    ops: u64,
-    concurrency: usize,
-    accounts: u64,
-    shards: u16,
-    queue_capacity: usize,
-    max_batch_size: usize,
-    data_dir: PathBuf,
-    sync_policy: SyncPolicy,
-    checkpoint: bool,
-    postgres_url: Option<String>,
+pub(crate) struct Config {
+    pub(crate) ops: u64,
+    pub(crate) concurrency: usize,
+    pub(crate) accounts: u64,
+    pub(crate) shards: u16,
+    pub(crate) queue_capacity: usize,
+    pub(crate) max_batch_size: usize,
+    pub(crate) data_dir: PathBuf,
+    pub(crate) sync_policy: SyncPolicy,
+    pub(crate) checkpoint: bool,
+    pub(crate) postgres_url: Option<String>,
+    pub(crate) replicas: u16,
+    pub(crate) failover: bool,
 }
 
 impl Config {
@@ -41,6 +45,8 @@ impl Config {
             sync_policy: SyncPolicy::Durable,
             checkpoint: false,
             postgres_url: None,
+            replicas: 0,
+            failover: false,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -57,6 +63,8 @@ impl Config {
                 "--unsafe-buffered" => config.sync_policy = SyncPolicy::UnsafeBuffered,
                 "--checkpoint" => config.checkpoint = true,
                 "--postgres-url" => config.postgres_url = Some(next(&mut args, "--postgres-url")?),
+                "--replicas" => config.replicas = next(&mut args, "--replicas")?,
+                "--failover" => config.failover = true,
                 "--help" | "-h" => {
                     print_help();
                     return Ok(None);
@@ -72,6 +80,21 @@ impl Config {
         }
         if config.queue_capacity == 0 || config.max_batch_size == 0 {
             return Err("queue and batch must be positive".into());
+        }
+        if config.replicas == 1 {
+            return Err("--replicas must be 0 (single-writer) or >= 2 (replicated)".into());
+        }
+        if config.replicas > 0 && config.replicas.is_multiple_of(2) {
+            return Err("--replicas must be odd for a healthy quorum".into());
+        }
+        if config.failover && config.replicas == 0 {
+            return Err("--failover requires --replicas >= 3".into());
+        }
+        if config.failover && config.replicas < 3 {
+            return Err("--failover requires --replicas >= 3 to keep a majority".into());
+        }
+        if config.replicas > 0 && (config.checkpoint || config.postgres_url.is_some()) {
+            return Err("--replicas mode does not combine with --checkpoint/--postgres-url".into());
         }
         if config.data_dir.exists() && std::fs::read_dir(&config.data_dir)?.next().is_some() {
             return Err("data-dir must be new or empty".into());
@@ -96,6 +119,10 @@ fn print_help() {
     println!("trading-loadgen [--ops N] [--concurrency N] [--accounts N] [--shards N]");
     println!("                [--queue N] [--batch N] [--data-dir PATH]");
     println!("                [--unsafe-buffered] [--checkpoint] [--postgres-url URL]");
+    println!("                [--replicas N] [--failover]");
+    println!();
+    println!("  --replicas N   shard-level Raft replication with N in-process replicas");
+    println!("  --failover     drill: kill each shard leader mid-run, measure failover");
 }
 
 struct WorkerResult {
@@ -119,6 +146,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         config.max_batch_size,
         config.sync_policy
     );
+    if config.replicas > 0 {
+        return replicated::run(config);
+    }
 
     let cluster_config = ClusterConfig {
         data_dir: config.data_dir.clone(),
@@ -403,7 +433,10 @@ fn run_worker(
             Err(SubmitError::Overloaded)
             | Err(SubmitError::Stopped)
             | Err(SubmitError::Storage(_))
-            | Err(SubmitError::Route(_)) => errors += 1,
+            | Err(SubmitError::Route(_))
+            // Replication-only errors cannot occur in single-writer mode.
+            | Err(SubmitError::ForwardToLeader { .. })
+            | Err(SubmitError::NoLeader) => errors += 1,
         }
         shard_latencies_ns[shard].push(started.elapsed().as_nanos() as u64);
     }
@@ -414,7 +447,9 @@ fn run_worker(
     }
 }
 
-fn require_success(result: trading_protocol::CommandResult) -> Result<(), Box<dyn Error>> {
+pub(crate) fn require_success(
+    result: trading_protocol::CommandResult,
+) -> Result<(), Box<dyn Error>> {
     if result.is_success() {
         Ok(())
     } else {
@@ -422,7 +457,7 @@ fn require_success(result: trading_protocol::CommandResult) -> Result<(), Box<dy
     }
 }
 
-fn percentile(sorted_ns: &[u64], per_mille: usize) -> f64 {
+pub(crate) fn percentile(sorted_ns: &[u64], per_mille: usize) -> f64 {
     if sorted_ns.is_empty() {
         return 0.0;
     }
@@ -430,14 +465,14 @@ fn percentile(sorted_ns: &[u64], per_mille: usize) -> f64 {
     sorted_ns[index] as f64 / 1000.0
 }
 
-struct XorShift(u64);
+pub(crate) struct XorShift(u64);
 
 impl XorShift {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self(seed)
     }
 
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;

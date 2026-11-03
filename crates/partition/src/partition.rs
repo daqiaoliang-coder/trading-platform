@@ -112,11 +112,15 @@ impl Partition {
     }
 
     /// Writes a durable snapshot before discarding the WAL it covers.
+    /// Checkpointing is always durable: it drops the WAL, so skipping fsync
+    /// here could lose more than the tail.
     pub fn checkpoint(&mut self) -> io::Result<()> {
         Snapshot::write_atomic(
             &self.snapshot_path,
             self.last_sequence,
+            0,
             &self.state.encode_snapshot(),
+            SyncPolicy::Durable,
         )?;
         self.wal.reset()
     }

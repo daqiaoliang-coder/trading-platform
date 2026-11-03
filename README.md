@@ -2,7 +2,14 @@
 
 一个面向高并发、强一致和持久化交易场景的分片式交易平台。项目采用 **分片单写状态机 + WAL 组提交 + 快照恢复 + 分片级复制** 的架构，通用数据库仅承担异步查询、对账和归档，不位于核心交易提交链路。
 
-> 当前阶段：M2 多逻辑分片、版本化路由和独立分片定序已实现。每分片拥有独立队列、单写线程、WAL 与快照；后续依次实现高可用和在线分片迁移。
+> 当前阶段：M3 分片级复制与自动故障切换已实现。每个分片是一个基于 openraft 的 Raft 复制组：多数派提交、快照追赶、leader fencing 与自动主备切换；传输层目前是进程内通道，跨节点网络化与在线迁移在 M4 进行。
+
+| 里程碑 | 状态 | 验收证据 |
+| --- | --- | --- |
+| M1 单机交易内核、WAL 与快照 | 已完成 | 见 [M1 已实现](#快速开始m1-单机-wal快照) 与 [本机 M1 基线](#本机-m1-基线) |
+| M2 多逻辑分片与无状态路由 | 已完成 | 见 [M2 多逻辑分片](#m2-多逻辑分片) |
+| M3 分片级复制与自动故障切换 | 已完成（2026-11-03） | 见 [M3 章节](#m3-分片级复制与自动故障切换) 与 [M3 验收结论](#m3-验收结论) |
+| M4 在线分片迁移与弹性扩容 | 未开始 | 见 [M4](#m4在线分片迁移与弹性扩容) |
 
 ## 1. 项目目标
 
@@ -84,6 +91,60 @@ cargo run --release -p trading-loadgen -- \
 
 追加 `--postgres-url postgres://user:password@host/database` 可启用异步已提交日志投影。各分片写线程在 WAL 提交和状态执行后，按分片序号发送 `(shard_id, route_version, sequence)` 事件；PostgreSQL 投影在独立线程中批量事务写入 `trading_committed_events`，并以该三元组主键和 `ON CONFLICT DO NOTHING` 保证重复消费不产生重复行。
 
+### M3 分片级复制与自动故障切换
+
+使用 `--replicas N`（奇数，至少 3）把每个分片组成 Raft 复制组。WAL 就是 Raft 日志：一条命令一条日志项，raft index 与命令序号一一对应；多数副本持久化后才向客户端确认提交。`--failover` 在压测中段杀死每个分片的 leader，测量选举与追赶并校验不丢不重。
+
+```bash
+cargo run --release -p trading-loadgen -- \
+  --replicas 3 \
+  --ops 20000 \
+  --concurrency 8 \
+  --accounts 64 \
+  --unsafe-buffered
+
+# 故障演练：压测中段杀 leader，测量选举与副本追赶
+cargo run --release -p trading-loadgen -- \
+  --replicas 3 \
+  --ops 6000 \
+  --concurrency 8 \
+  --accounts 64 \
+  --unsafe-buffered \
+  --failover
+```
+
+已实现：
+
+- 基于 openraft 0.9（选型见 [ADR 0001](docs/adr/0001-raft-implementation-choice.md)）的分片复制组：bootstrap、多数派提交、日志复制与快照压实。
+- leader fencing：客户端只接受 quorum-ack 未过期的 leader；旧主恢复后以 follower 身份追赶日志，不能继续写入。
+- 客户端重定向与幂等重试：`NoLeader`/`ForwardToLeader` 时复用同一 `request_id` 重试，切换期间不重复扣账。
+- 副本运维工具：crash/restart 副本、快照加日志追赶、目录文件锁拒绝双开。
+- 进程内传输带定向断链注入，用于网络分区演练。
+
+故障注入测试（`replication/tests/m3_acceptance.rs`）覆盖：主崩溃后已提交日志不丢失、分区中的 leader 无法提交、重复请求跨切换只应用一次、落后副本经快照和日志追平、同目录双开被拒绝。
+
+2026-11-03，本机 macOS Intel x86_64，release 构建，3 副本、1 分片、8 并发、64 账户、快照阈值 1000：
+
+| 模式 | 吞吐量 | P50 | P99 | P999 | 错误/重试 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| UnsafeBuffered 3 副本（2 万笔） | 13,586 ops/s | 316us | 3.4ms | 25.9ms | 0/0 |
+| Durable 3 副本（2 千笔） | 43 ops/s | 179.1ms | 203.9ms | 259.4ms | 0/0 |
+
+- 复制模式下快照、日志压实和冲突截断遵循 `--unsafe-buffered`/Durable 语义；此前这些路径无条件 fsync（macOS 目录 fsync 单次约 60-100ms，且在状态机 worker 内阻塞应用），修复前基线仅 296 ops/s、P99=376ms。
+- Durable 复制的瓶颈是本机磁盘：quorum 提交路径串行执行 leader 与 follower 各一次 fsync（对照：同机单写引擎每批一次 fsync，P50=19.1ms）。该数字只代表本机环境。
+- 故障演练（UnsafeBuffered，6 千笔）：election_ms=1,578、catchup_ms=105、RPO=0-committed、客户端 0 错误 0 重试；切换停写窗口由内部重试吸收（P999=1.63s）。
+
+### M3 验收结论
+
+| 验收标准 | 结论 | 证据 |
+| --- | --- | --- |
+| 主节点故障后已提交日志不丢失，旧主恢复后不能继续写入 | 通过 | `leader_crash_failover_preserves_committed_writes`：崩主后继续提交，存活副本余额等于崩溃前已提交总额；旧主重启后以 follower 追平且 term 与集群收敛 |
+| 网络分区、重复请求和切换期间重试不会导致重复扣账 | 通过 | `partitioned_leader_cannot_commit_and_retries_apply_once`：隔离 leader 只得到 `NoLeader`，愈合后同 `request_id` 重放返回原结果，三副本余额仅扣一次 |
+| 新副本可通过快照和日志完成追赶 | 通过 | `lagging_replica_catches_up_after_snapshot_purge`：副本停机期间日志被快照压实（阈值 30），重启后经快照加日志追平并继续跟随 |
+| 记录并评估故障检测时间、切换停写时间和恢复目标 | 通过 | election_ms=1,578、catchup_ms=105、RPO=0-committed、客户端 0 错误 0 重试 |
+
+故障注入测试共 5 项全部通过（`cargo test -p trading-replication`），另有 `commit_replicates_and_duplicate_requests_apply_once` 与 `replica_directory_lock_fences_double_open` 覆盖复制可见性、重复请求去重和目录双开围栏。
+
 ### 本机 M1 基线
 
 2026-11-01，本机 macOS Intel x86_64，release 构建，10 万笔转账、32 并发、1024 个账户、最大批次 64。每笔命令 44 字节，对应 WAL 记录 68 字节；结果不包含账户初始化耗时。
@@ -101,8 +162,10 @@ cargo run --release -p trading-loadgen -- \
 - 当前 checkpoint 在单写执行器停止、取得 `Partition` 所有权后执行；在线快照将在后续实现。
 - 幂等结果完整保存在内存和快照中，尚未实现保留窗口和淘汰策略。
 - 已测试半条日志与 CRC 损坏，尚未进行真实断电、磁盘固件和带断电保护硬件验证。
-- 当前仅提供本地持久化，不包含副本、主机故障 RPO=0 或自动故障切换。
-- PostgreSQL 投影是在线最小实现，投影故障后的自动追赶及其与 checkpoint 的协调尚未实现。
+- 复制组传输层为进程内通道：副本崩溃、分区与切换都在单进程内注入和验证；跨节点网络化、真实网络分区与 TLS 属于 M4。
+- 副本数据目录使用 fs2 文件锁防止跨进程双开；同进程内由门面层防护，跨机器部署需要控制面协调。
+- `--replicas` 复制模式暂未接入 PostgreSQL 投影（单写模式已支持），投影与复制组的位点协调在后续里程碑处理。
+- UnsafeBuffered 下快照、日志压实和截断不做 fsync，与该模式“崩溃可能丢失最近写入”的契约一致；checkpoint 例外，它总是全量刷盘。
 
 ## 2. 总体架构
 
@@ -224,6 +287,8 @@ request
 
 ### M1：单机交易内核、WAL 与快照
 
+**状态：已完成。**
+
 **目标**：先实现一个正确、可恢复、可压测的单分片交易内核。
 
 主要交付：
@@ -244,6 +309,8 @@ request
 
 ### M2：多逻辑分片与无状态路由
 
+**状态：已完成。**
+
 **目标**：将单节点内核扩展为可分片部署的数据面。
 
 主要交付：
@@ -263,6 +330,8 @@ request
 
 ### M3：分片级复制与自动故障切换
 
+**状态：已完成（2026-11-03）。** 实现与验收证据见 [M3 章节](#m3-分片级复制与自动故障切换)；Raft 选型见 [ADR 0001](docs/adr/0001-raft-implementation-choice.md)。
+
 **目标**：让每个分片成为可容错的小型复制状态机。
 
 主要交付：
@@ -281,6 +350,8 @@ request
 - 记录并评估故障检测时间、切换停写时间和恢复目标。
 
 ### M4：在线分片迁移与弹性扩容
+
+**状态：未开始。**
 
 **目标**：新增节点后，可以在不全集群停写的情况下重新分配分片。
 
@@ -308,7 +379,7 @@ request
 | 分片执行 | 固定 OS 线程 + 有界 SPSC/MPSC 队列 | 分片单写，避免共享可变状态和锁竞争 |
 | WAL | 批量顺序写、`sync_data`；后续评估预分配与 `writev` | 先建立可靠基线，再根据 profile 评估 `io_uring` |
 | 日志格式 | 固定小端二进制 + CRC32 | 避免 JSON 热路径开销，支持损坏检测 |
-| 分片复制 | 成熟 Raft 实现 | M3 通过 ADR 确定具体库，禁止自研共识 |
+| 分片复制 | openraft 0.9（Rust） | 经 [ADR 0001](docs/adr/0001-raft-implementation-choice.md) 选定，已用于 M3 分片复制组；禁止自研共识 |
 | 控制面 | Go + gRPC | 路由、节点、迁移和运维工具 |
 | 查询投影 | PostgreSQL | 异步查询、对账和归档，不在提交主链路 |
 | 消息系统 | 初期不强制；需要时引入 Kafka | 仅传输已提交事件，不是核心提交依赖 |
@@ -334,7 +405,7 @@ trading-platform/
 │   ├── storage/        # WAL、快照、校验与恢复
 │   ├── partition/      # 单写状态机、队列、路由和分片执行
 │   ├── projection/     # 已提交日志的异步 PostgreSQL 投影
-│   ├── replication/    # M3：分片复制与主备切换
+│   ├── replication/    # 分片复制与主备切换（M3 已实现）
 │   ├── gateway/        # 网络接入、路由和背压
 │   └── loadgen/        # 独立压测与延迟直方图
 ├── control-plane/      # M4：Go 控制面与迁移编排
@@ -360,10 +431,10 @@ trading-platform/
 严格按以下顺序推进：
 
 ```text
-M1 单机 WAL/快照
-  -> M2 多分片路由
-  -> M3 Raft 主备切换
-  -> M4 在线分片迁移
+M1 单机 WAL/快照       已完成
+  -> M2 多分片路由      已完成
+  -> M3 Raft 主备切换   已完成
+  -> M4 在线分片迁移    未开始
 ```
 
 每个里程碑先满足正确性和故障注入验收，再进行性能优化。性能数字只有在交易语义、持久化等级和故障行为明确之后才有意义。
