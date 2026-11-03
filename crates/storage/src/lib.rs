@@ -4,4 +4,4 @@ mod snapshot;
 mod wal;
 
 pub use snapshot::Snapshot;
-pub use wal::{SyncPolicy, Wal, WalRecord};
+pub use wal::{LogBoundary, SyncPolicy, Wal, WalRecord};

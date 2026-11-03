@@ -4,6 +4,7 @@ members = [
     "crates/storage",
     "crates/partition",
     "crates/projection",
+    "crates/replication",
     "crates/loadgen",
 ]
 resolver = "2"
@@ -16,10 +17,13 @@ license = "MIT"
 [workspace.dependencies]
 crc32fast = "1.4"
 fs2 = "0.4"
+openraft = { version = "0.9.21", features = ["single-term-leader", "storage-v2"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "io-util"] }
 trading-protocol = { path = "crates/protocol" }
 trading-storage = { path = "crates/storage" }
 trading-partition = { path = "crates/partition" }
 trading-projection = { path = "crates/projection" }
+trading-replication = { path = "crates/replication" }
 postgres = "0.19"
 
 [profile.release]

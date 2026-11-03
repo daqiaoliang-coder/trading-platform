@@ -1,0 +1,17 @@
+[package]
+name = "trading-replication"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crc32fast.workspace = true
+fs2.workspace = true
+openraft.workspace = true
+tokio.workspace = true
+trading-protocol.workspace = true
+trading-storage.workspace = true
+trading-partition.workspace = true
+
+[lib]
+path = "src/lib.rs"

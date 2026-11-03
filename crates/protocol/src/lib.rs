@@ -235,6 +235,14 @@ pub enum SubmitError {
     Stopped,
     Storage(String),
     Route(RouteError),
+    /// Replication-group redirect: the target shard is not the current
+    /// leader. `leader` carries the hint when the group knows one.
+    /// Clients should retry the same `request_id` on the hinted replica.
+    ForwardToLeader {
+        leader: Option<u64>,
+    },
+    /// No leader could commit within the client deadline; retry later.
+    NoLeader,
 }
 
 impl fmt::Display for SubmitError {
@@ -244,6 +252,11 @@ impl fmt::Display for SubmitError {
             Self::Stopped => write!(f, "partition executor has stopped"),
             Self::Storage(message) => write!(f, "storage failure: {message}"),
             Self::Route(error) => write!(f, "routing failure: {error}"),
+            Self::ForwardToLeader { leader } => match leader {
+                Some(node) => write!(f, "not leader; retry on replica {node}"),
+                None => write!(f, "not leader; leader unknown"),
+            },
+            Self::NoLeader => write!(f, "no leader elected within the retry deadline"),
         }
     }
 }
