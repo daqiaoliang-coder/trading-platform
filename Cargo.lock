@@ -1346,6 +1346,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "trading-node"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "trading-partition",
+ "trading-protocol",
+ "trading-replication",
+ "trading-storage",
+]
+
+[[package]]
 name = "trading-partition"
 version = "0.1.0"
 dependencies = [

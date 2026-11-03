@@ -28,6 +28,7 @@ pub(crate) struct Config {
     pub(crate) postgres_url: Option<String>,
     pub(crate) replicas: u16,
     pub(crate) failover: bool,
+    pub(crate) migrate: bool,
 }
 
 impl Config {
@@ -47,6 +48,7 @@ impl Config {
             postgres_url: None,
             replicas: 0,
             failover: false,
+            migrate: false,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -65,6 +67,7 @@ impl Config {
                 "--postgres-url" => config.postgres_url = Some(next(&mut args, "--postgres-url")?),
                 "--replicas" => config.replicas = next(&mut args, "--replicas")?,
                 "--failover" => config.failover = true,
+                "--migrate" => config.migrate = true,
                 "--help" | "-h" => {
                     print_help();
                     return Ok(None);
@@ -93,6 +96,17 @@ impl Config {
         if config.failover && config.replicas < 3 {
             return Err("--failover requires --replicas >= 3 to keep a majority".into());
         }
+        if config.migrate && config.replicas == 0 {
+            return Err("--migrate requires --replicas >= 3".into());
+        }
+        if config.migrate && config.replicas < 3 {
+            return Err("--migrate requires --replicas >= 3 to keep a majority".into());
+        }
+        if config.migrate && config.failover {
+            return Err(
+                "--migrate and --failover are separate drills; run them one at a time".into(),
+            );
+        }
         if config.replicas > 0 && (config.checkpoint || config.postgres_url.is_some()) {
             return Err("--replicas mode does not combine with --checkpoint/--postgres-url".into());
         }
@@ -119,10 +133,12 @@ fn print_help() {
     println!("trading-loadgen [--ops N] [--concurrency N] [--accounts N] [--shards N]");
     println!("                [--queue N] [--batch N] [--data-dir PATH]");
     println!("                [--unsafe-buffered] [--checkpoint] [--postgres-url URL]");
-    println!("                [--replicas N] [--failover]");
+    println!("                [--replicas N] [--failover] [--migrate]");
     println!();
     println!("  --replicas N   shard-level Raft replication with N in-process replicas");
     println!("  --failover     drill: kill each shard leader mid-run, measure failover");
+    println!("  --migrate      drill: relocate shard 0 to a fresh voter mid-run and retire");
+    println!("                 its old leader (scale-out + move + scale-in under load)");
 }
 
 struct WorkerResult {

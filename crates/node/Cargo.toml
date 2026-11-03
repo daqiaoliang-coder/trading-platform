@@ -1,0 +1,17 @@
+[package]
+name = "trading-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+trading-partition.workspace = true
+trading-protocol.workspace = true
+trading-replication.workspace = true
+trading-storage.workspace = true
+
+[[bin]]
+name = "trading-node"
+path = "src/main.rs"

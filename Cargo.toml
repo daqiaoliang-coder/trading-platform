@@ -6,6 +6,7 @@ members = [
     "crates/projection",
     "crates/replication",
     "crates/loadgen",
+    "crates/node",
 ]
 resolver = "2"
 
@@ -24,6 +25,8 @@ trading-storage = { path = "crates/storage" }
 trading-partition = { path = "crates/partition" }
 trading-projection = { path = "crates/projection" }
 trading-replication = { path = "crates/replication" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 postgres = "0.19"
 
 [profile.release]

@@ -2,14 +2,14 @@
 
 一个面向高并发、强一致和持久化交易场景的分片式交易平台。项目采用 **分片单写状态机 + WAL 组提交 + 快照恢复 + 分片级复制** 的架构，通用数据库仅承担异步查询、对账和归档，不位于核心交易提交链路。
 
-> 当前阶段：M3 分片级复制与自动故障切换已实现。每个分片是一个基于 openraft 的 Raft 复制组：多数派提交、快照追赶、leader fencing 与自动主备切换；传输层目前是进程内通道，跨节点网络化与在线迁移在 M4 进行。
+> 当前阶段：M4 在线分片迁移与弹性扩容已实现。每个分片是一个成员集可动态变更的 openraft 复制组；迁移只冻结目标分片，完成 learner 追赶、精确位点校验、成员变更、旧主 fence、目标主选举和路由 epoch 原子发布。Go 控制面提供迁移编排与审计 API，Rust 节点暴露本地管理接口；传输层仍为进程内通道，跨机器网络化是明确的后续边界。
 
 | 里程碑 | 状态 | 验收证据 |
 | --- | --- | --- |
 | M1 单机交易内核、WAL 与快照 | 已完成 | 见 [M1 已实现](#快速开始m1-单机-wal快照) 与 [本机 M1 基线](#本机-m1-基线) |
 | M2 多逻辑分片与无状态路由 | 已完成 | 见 [M2 多逻辑分片](#m2-多逻辑分片) |
 | M3 分片级复制与自动故障切换 | 已完成（2026-11-03） | 见 [M3 章节](#m3-分片级复制与自动故障切换) 与 [M3 验收结论](#m3-验收结论) |
-| M4 在线分片迁移与弹性扩容 | 未开始 | 见 [M4](#m4在线分片迁移与弹性扩容) |
+| M4 在线分片迁移与弹性扩容 | 已完成（2026-11-03） | 见 [M4 章节](#m4-在线分片迁移与弹性扩容) 与 [M4 验收结论](#m4-验收结论) |
 
 ## 1. 项目目标
 
@@ -75,7 +75,7 @@ cargo run --release -p trading-loadgen -- \
 
 ### M2 多逻辑分片
 
-使用 `--shards` 指定逻辑分片数。路由表携带单调递增的版本，账户按固定路由槽定位分片；M2 只允许提升版本，槽位映射变更由 M4 的状态与幂等迁移流程处理。原子转账要求两个账户位于同一分片，跨分片转账在进入执行队列前拒绝。
+使用 `--shards` 指定逻辑分片数。路由表携带单调递增的版本，账户按固定路由槽定位分片；M2 只允许提升版本，M4 的在线迁移只改变分片的物理 voter 集并提升 epoch，逻辑槽位映射保持不变。原子转账要求两个账户位于同一分片，跨分片转账在进入执行队列前拒绝。
 
 ```bash
 cargo run --release -p trading-loadgen -- \
@@ -93,7 +93,7 @@ cargo run --release -p trading-loadgen -- \
 
 ### M3 分片级复制与自动故障切换
 
-使用 `--replicas N`（奇数，至少 3）把每个分片组成 Raft 复制组。WAL 就是 Raft 日志：一条命令一条日志项，raft index 与命令序号一一对应；多数副本持久化后才向客户端确认提交。`--failover` 在压测中段杀死每个分片的 leader，测量选举与追赶并校验不丢不重。
+使用 `--replicas N`（奇数，至少 3）把每个分片组成 Raft 复制组。WAL 就是 Raft 日志：一条命令一条日志项，raft index 与命令序号一一对应；多数副本持久化后才向客户端确认提交。`--failover` 在压测中段杀死每个分片的 leader，测量选举与追赶并校验不丢不重；`--migrate` 在压测中段在线搬迁分片 0，见 [M4 章节](#m4-在线分片迁移与弹性扩容)。
 
 ```bash
 cargo run --release -p trading-loadgen -- \
@@ -145,6 +145,84 @@ cargo run --release -p trading-loadgen -- \
 
 故障注入测试共 5 项全部通过（`cargo test -p trading-replication`），另有 `commit_replicates_and_duplicate_requests_apply_once` 与 `replica_directory_lock_fences_double_open` 覆盖复制可见性、重复请求去重和目录双开围栏。
 
+### M4 在线分片迁移与弹性扩容
+
+在线迁移只改变分片的**物理 voter 集**，不改变逻辑的账户→分片映射。每个分片仍是独立 Raft 组，迁移按集群串行编排，其他分片持续服务。
+
+已实现：
+
+- 动态副本集合：运行期创建、停止、退役副本；目标副本以 learner 加入，经快照和 WAL 追赶到 `catchup_lag` 阈值以内。
+- 完整迁移序列：创建目标副本 → learner 加入 → 持续追赶 → 冻结该分片提交 → 精确位点校验（lag=0）→ 成员变更（ReplaceAllVoters）→ 提交后同步成员日志 → 退役旧主 → 选举新主 → 原子发布路由 epoch。
+- 分片级停写：每分片一个 `RwLock<()>` 提交闸门。普通提交取读锁；迁移冻结取写锁，先排空在途提交再进入临界区，因此停写是有界等待而不是请求失败。
+- 迁移模式：`scale-out`、`relocate-leader`、`scale-in`、`replace`。
+- 旧主 fence：旧主在闸门内停止并写入 `retired-{id}` 标记；重启后不会被发现为 voter，也不能成为 leader。目标副本有落后日志时不会被偏好选举绕过。
+- 路由收敛与重定向：客户端缓存 `Route`；epoch 不匹配时返回 `StaleRoute { current }`，刷新后用同一 `request_id` 重试，状态机幂等去重。
+- 失败语义：成员变更提交前失败 → `RolledBack`，丢弃目标副本，旧 voter 集与 epoch 保持不变；变更已提交但后续步骤失败 → `Degraded`，绝不回滚已提交的 voter 集，仍发布 epoch 并保留现场。
+- 审计：迁移报告包含 voters/leader/epoch 前后值、追赶位点、`positions_before_promote`、分阶段耗时和逐事件时间线；Go 控制面将每次尝试追加到 `audit.jsonl`，含幂等键、节点 HTTP 状态和完整节点报告。
+
+节点与管理 API：
+
+```bash
+cargo run --release -p trading-node -- \
+  --data-dir data/node --shards 4 --replicas 3 \
+  --unsafe-buffered --admin-addr 127.0.0.1:8081
+```
+
+`trading-node` 只暴露运维管理接口，不是客户端交易网关：`GET /admin/health`、`GET /admin/routes`、`GET /admin/shards`、`GET /admin/shards/{id}`、`POST /admin/shards/{id}/migrate`、`POST /admin/shutdown`。迁移返回 `200 completed`、`409 rolled-back`、`503 degraded`；可用 `"fault":"crash-target-before-learner"` 注入回滚演练。
+
+Go 控制面（策略校验、幂等键、审计持久化）：
+
+```bash
+cd control-plane
+go run ./cmd/controlplane \
+  --addr 127.0.0.1:8080 \
+  --node-url http://127.0.0.1:8081 \
+  --state-dir control-plane-state
+
+curl -s -X POST http://127.0.0.1:8080/v1/shards/0/migrations \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: shard-0-to-node-4' \
+  -d '{"mode":"relocate-leader","target_node":4}'
+
+curl -s http://127.0.0.1:8080/v1/shards
+curl -s http://127.0.0.1:8080/v1/migrations
+```
+
+控制面接口：`GET /healthz`、`GET /v1/node`、`GET /v1/shards`、`GET /v1/routes`、`POST /v1/shards/{shard}/migrations`、`GET /v1/migrations`、`GET /v1/migrations/{id}`。迁移结果映射为 `201 completed`、`409 rolled-back`、`503 degraded`、`502` 传输失败；相同 `Idempotency-Key` 重放返回原记录（`200` + `replayed:true`），且同一分片存在在途迁移时拒绝新计划。
+
+压测中段在线搬迁分片 0（先扩到 4 voter，再退役旧主缩回 3 voter）：
+
+```bash
+cargo run --release -p trading-loadgen -- \
+  --replicas 3 --shards 4 --ops 100000 --concurrency 16 \
+  --accounts 256 --unsafe-buffered --migrate
+```
+
+2026-11-03，本机 macOS Intel x86_64，release 构建，3 副本、4 分片、16 并发、256 账户、10 万笔转账、UnsafeBuffered：
+
+| 指标 | 结果 |
+| --- | --- |
+| 吞吐与正确性 | 15,982 ops/s；100,000 笔全部成功，0 错误、0 重试失败 |
+| 全量延迟 | P50 286.1us / P99 20.3ms / P999 67.3ms |
+| 迁移总耗时 | 1,579ms（追赶 335ms、冻结 40ms、成员切换 25ms、选举 1,090ms） |
+| 被迁移分片停写 | 冻结临界区 40ms；闸门释放后的选举约 1.09s，分片 0 观察 max 1.19s，由客户端重试吸收 |
+| 其他分片影响 | 迁移窗口内 P99 18.5–20.3ms、max 19.8–20.3ms，无停写 |
+| 路由收敛 | epoch 1 → 2，64 次 stale-route 重定向后收敛；`route.version` 持久化 |
+| 数据一致性 | 各分片每个副本余额 640,000,000,000、账户数 64、applied 位点一致；旧主 1 退役后不在 voter 集 |
+
+说明：`freeze_ms` 只覆盖成员变更与旧主退役的临界区；停写的主要部分来自旧主退役后的 leader lease 等待，必须等约一个 election timeout 才允许新主当选，这是当前设计的有意安全边界。
+
+### M4 验收结论
+
+| 验收标准 | 结论 | 证据 |
+| --- | --- | --- |
+| 迁移期间不出现双主、已提交交易丢失或重复执行 | 通过 | `online_migration_freezes_only_target_shard_and_fences_old_primary` 全程采样每个分片最多一个 leader，旧主退役后不能当选；10 万笔演练 0 错误，逐副本余额守恒且位点一致；迁移后的重试复用 `request_id`，幂等结果不重复 |
+| 只有被迁移分片出现受控的短暂停写，其他分片持续服务 | 通过 | 同一测试在迁移期间对另一分片持续提交并断言全部成功；演练中其他分片迁移窗口 P99 约 20ms、max 约 20.3ms，无停写 |
+| 新旧路由最终收敛，旧主被可靠 fence | 通过 | 路由 epoch 与持久化 `route.version` 一致；`migrated_group_reopens_with_new_membership_and_epoch` 重启后恢复新 voter 集与 epoch；重启退役副本不进入 voter 集也不能成为 leader |
+| 在持续压测下记录迁移对 P99/P999 和恢复时间的影响 | 通过 | 上文基线与 `migration_window`/`migration_pause` 输出：整体 P99 20.3ms、P999 67.3ms；目标分片 max 1.19s，其他分片 P99 约 20ms |
+
+M4 测试共 4 项（`crates/replication/tests/m4_acceptance.rs`）全部通过：在线迁移与 fence、失败回滚与重试、扩缩容保持多数派、迁移后重启恢复。节点管理 API 集成测试与 Go 控制面单元测试覆盖迁移状态映射、幂等重放、在途冲突和审计落盘。
+
 ### 本机 M1 基线
 
 2026-11-01，本机 macOS Intel x86_64，release 构建，10 万笔转账、32 并发、1024 个账户、最大批次 64。每笔命令 44 字节，对应 WAL 记录 68 字节；结果不包含账户初始化耗时。
@@ -158,14 +236,19 @@ cargo run --release -p trading-loadgen -- \
 
 ### 当前边界
 
-- 当前是嵌入式交易内核和压测工具，尚未提供网络服务。
+- 当前是嵌入式交易内核、复制节点进程和压测工具，尚未提供面向客户端的网络交易网关；`trading-node` 只暴露运维 admin API。
 - 当前 checkpoint 在单写执行器停止、取得 `Partition` 所有权后执行；在线快照将在后续实现。
 - 幂等结果完整保存在内存和快照中，尚未实现保留窗口和淘汰策略。
 - 已测试半条日志与 CRC 损坏，尚未进行真实断电、磁盘固件和带断电保护硬件验证。
-- 复制组传输层为进程内通道：副本崩溃、分区与切换都在单进程内注入和验证；跨节点网络化、真实网络分区与 TLS 属于 M4。
+- 复制组传输层为进程内通道：副本崩溃、分区、切换与迁移都在单进程内注入和验证；跨节点网络化、真实网络分区与 TLS 仍是后续边界。
 - 副本数据目录使用 fs2 文件锁防止跨进程双开；同进程内由门面层防护，跨机器部署需要控制面协调。
 - `--replicas` 复制模式暂未接入 PostgreSQL 投影（单写模式已支持），投影与复制组的位点协调在后续里程碑处理。
 - UnsafeBuffered 下快照、日志压实和截断不做 fsync，与该模式“崩溃可能丢失最近写入”的契约一致；checkpoint 例外，它总是全量刷盘。
+- 迁移编排在单进程内验证：每分片 voter 是组内副本 id，不是跨机器地址；跨机器副本网络化、TLS/鉴权和多节点容量调度属于后续。
+- 迁移中逻辑槽位映射保持不变，只改变物理 voter 集并提升 epoch；改变账户→分片映射的热点槽位搬迁尚未实现。
+- 迁移按集群串行化；同一集群的并行多分片迁移、全局迁移队列与限流尚未实现。
+- 退役副本保留数据目录供 fence 演练人工重启，不自动清理。
+- Go 控制面是单实例内存索引加 JSONL 审计，无分布式协调、TLS 或鉴权。
 
 ## 2. 总体架构
 
@@ -351,7 +434,7 @@ request
 
 ### M4：在线分片迁移与弹性扩容
 
-**状态：未开始。**
+**状态：已完成（2026-11-03）。** 实现与验收证据见 [M4 章节](#m4-在线分片迁移与弹性扩容)；代码位于 `crates/replication`（迁移编排）、`crates/node`（节点管理 API）与 `control-plane/`（Go 控制面）。
 
 **目标**：新增节点后，可以在不全集群停写的情况下重新分配分片。
 
@@ -380,7 +463,7 @@ request
 | WAL | 批量顺序写、`sync_data`；后续评估预分配与 `writev` | 先建立可靠基线，再根据 profile 评估 `io_uring` |
 | 日志格式 | 固定小端二进制 + CRC32 | 避免 JSON 热路径开销，支持损坏检测 |
 | 分片复制 | openraft 0.9（Rust） | 经 [ADR 0001](docs/adr/0001-raft-implementation-choice.md) 选定，已用于 M3 分片复制组；禁止自研共识 |
-| 控制面 | Go + gRPC | 路由、节点、迁移和运维工具 |
+| 控制面 | Go + HTTP/JSON（当前标准库实现） | 路由、节点、迁移和运维工具；接口稳定后可评估 gRPC |
 | 查询投影 | PostgreSQL | 异步查询、对账和归档，不在提交主链路 |
 | 消息系统 | 初期不强制；需要时引入 Kafka | 仅传输已提交事件，不是核心提交依赖 |
 | 可观测性 | Prometheus + Grafana + OpenTelemetry | 覆盖吞吐、延迟、日志、副本和迁移指标 |
@@ -405,10 +488,11 @@ trading-platform/
 │   ├── storage/        # WAL、快照、校验与恢复
 │   ├── partition/      # 单写状态机、队列、路由和分片执行
 │   ├── projection/     # 已提交日志的异步 PostgreSQL 投影
-│   ├── replication/    # 分片复制与主备切换（M3 已实现）
+│   ├── replication/    # 分片复制、主备切换与在线迁移（M3/M4）
+│   ├── node/           # 复制节点进程与本地管理 API（M4）
 │   ├── gateway/        # 网络接入、路由和背压
-│   └── loadgen/        # 独立压测与延迟直方图
-├── control-plane/      # M4：Go 控制面与迁移编排
+│   └── loadgen/        # 独立压测、故障与迁移演练
+├── control-plane/      # Go 控制面：迁移编排、策略校验与审计（M4）
 ├── deploy/             # 本地依赖和监控环境
 ├── docs/
 │   └── adr/            # 关键架构决策记录
@@ -434,7 +518,7 @@ trading-platform/
 M1 单机 WAL/快照       已完成
   -> M2 多分片路由      已完成
   -> M3 Raft 主备切换   已完成
-  -> M4 在线分片迁移    未开始
+  -> M4 在线分片迁移    已完成
 ```
 
 每个里程碑先满足正确性和故障注入验收，再进行性能优化。性能数字只有在交易语义、持久化等级和故障行为明确之后才有意义。
